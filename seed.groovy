@@ -1,0 +1,177 @@
+#!groovy
+
+job('create_terraform_jobs') {
+  parameters {
+    stringParam 'gh_owner', '', 'User or organization for the github repo, eg: https://github.com/OWNER/repo'
+    stringParam 'gh_repo', '', 'Repo where TF code is stored, eg: https://github.com/owner/REPO'
+    stringParam 'gh_path', '', 'Root of terraform code inside the repo. Dont use slashes here, trailing or otherwise, and it can be only one level deep. Empty string if tf code is in /, use this for dev/staging/prod envs'
+    stringParam 's3_bucket', '', 'Name of S3 bucket for terraform state files'
+    stringParam 's3_key', '', 'Key/path to store this enviroment\'s state file in s3; the "name" of the environment'
+    credentialsParam('gh_credentials_id') {
+      description 'SSH private key for github. (Use \'git\' as the username)'
+      type 'com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey'
+      required(true)
+    }
+    stringParam 'tf_version', '0.11.2', 'Terraform version to install and use'
+    stringParam 'tf_arch', 'linux_amd64', 'Terraform arch to install and use'
+    stringParam 'tf_sha256', 'f728fa73ff2a4c4235a28de4019802531758c7c090b6ca4c024d48063ab8537b', 'Terraform .zip sha256 sum'
+    booleanParam 'create_destroy_job', false, 'Create a DESTROY job for this environment'
+    textParam 'env_vars', '', 'Multi-line text input containing NAME=VALUE pairs. While not recommend, this is one way to pass auth data eg: `AWS_ACCESS_KEY_ID` & `AWS_SECRET_ACCESS_KEY`'
+  }
+  scm {
+    github 'Savasw/terraform_pipeline'
+  }
+  steps {
+    dsl {
+      text '''\
+        folder 'Terraform'
+        folder "Terraform/${gh_owner}"
+        folder "Terraform/${gh_owner}/${gh_repo}"
+
+        def tf_job(job_name, workflow) {
+          if (gh_path == '') {
+            name = "Terraform/${gh_owner}/${gh_repo}/${job_name}"
+          } else {
+            name = "Terraform/${gh_owner}/${gh_repo}/${job_name}_${gh_path}"
+          }
+          pipelineJob(name) {
+            properties {
+              githubProjectUrl("http://github.com/${gh_owner}/${gh_repo}")
+            }
+            parameters {
+              wReadonlyStringParameterDefinition {
+                name 's3_bucket'
+                defaultValue s3_bucket
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 's3_key'
+                defaultValue s3_key
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 'gh_credentials_id'
+                defaultValue gh_credentials_id
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 'tf_version'
+                defaultValue tf_version
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 'tf_arch'
+                defaultValue tf_arch
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 'tf_sha256'
+                defaultValue tf_sha256
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 'gh_owner'
+                defaultValue gh_owner
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 'gh_repo'
+                defaultValue gh_repo
+                description ''
+              }
+              wReadonlyStringParameterDefinition {
+                name 'gh_path'
+                defaultValue gh_path
+                description ''
+              }
+              wReadonlyTextParameterDefinition {
+                name 'env_vars'
+                defaultValue env_vars
+                description ''
+              }
+              stringParam('GITHUB_PR_NUMBER', '', '')
+              stringParam('GITHUB_PR_SOURCE_BRANCH', '', '')
+            }
+            definition {
+              cps {
+                // sandbox() // uncomment then whitelist methods under _In-process Script Approval_ if using the groovy sandbox
+                script readFileFromWorkspace('pipeline.groovy') + workflow
+              }
+            }
+          }
+        }
+
+        def tf_plan_job = tf_job 'PLAN', """
+          withEnv(_env_vars) {
+            node {
+              pull_request=true
+              git_checkout()
+              prepare_workspace()
+              setup_tf()
+              tf_validate()
+              fetch_modules()
+              tf_plan()
+            }
+          }
+        """.stripIndent()
+        
+        tf_plan_job.with {
+          triggers {
+            gitHubPRTrigger {
+              spec '* * * * *'
+              triggerMode 'HEAVY_HOOKS_CRON'
+              branchRestriction {
+                targetBranch 'master'
+              }
+              events {
+                gitHubPROpenEvent()
+                gitHubPRCommitEvent()
+                gitHubPRCommentEvent {
+                  comment 'replan'
+                }
+              }
+              skipFirstRun(true)
+            }
+          }
+        }
+
+        def tf_apply_job = tf_job 'APPLY', """
+          withEnv(_env_vars) {
+            node {
+              git_checkout()
+              prepare_workspace()
+              setup_tf()
+              tf_validate()
+              fetch_modules()
+              tf_plan()
+              tf_apply()
+            }
+          }
+        """.stripIndent()
+        
+        tf_apply_job.with {
+          triggers {
+            scm('* * * * *')
+          }
+        }
+
+        if (create_destroy_job.toBoolean()) {
+          def tf_destroy_job = tf_job 'DESTROY', """
+            withEnv(_env_vars) {
+              node {
+                git_checkout()
+                prepare_workspace()
+                setup_tf()
+                tf_validate()
+                fetch_modules()
+                tf_plan('-destroy')             
+                tf_apply()
+              }
+            }
+          """.stripIndent()
+        }
+
+      '''.stripIndent()
+    }
+  }
+}
